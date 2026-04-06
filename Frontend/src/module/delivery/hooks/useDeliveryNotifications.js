@@ -28,6 +28,34 @@ export const useDeliveryNotifications = () => {
   // Step 3: All callbacks before effects (unconditional)
   // Track user interaction for autoplay policy
   const userInteractedRef = useRef(false);
+
+  const refreshDeliveryPartner = useCallback(async () => {
+    try {
+      const response = await deliveryAPI.getCurrentDelivery();
+      if (response.data?.success && response.data.data) {
+        const deliveryPartner = response.data.data.user || response.data.data.deliveryPartner;
+        if (deliveryPartner) {
+          setDeliveryBatchState({
+            activeAssignedOrderCount: Array.isArray(deliveryPartner.assignedOrders)
+              ? deliveryPartner.assignedOrders.length
+              : 0,
+            assignedOrders: deliveryPartner.assignedOrders || [],
+            route: deliveryPartner.route || [],
+            nextDeliveryLocation: deliveryPartner.route?.[0] || null,
+          });
+          const id = deliveryPartner.id?.toString() ||
+                    deliveryPartner._id?.toString() ||
+                    deliveryPartner.deliveryId;
+          if (id) {
+            setDeliveryPartnerId(id);
+            console.log('Delivery partner refreshed:', id);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error refreshing delivery partner:', error);
+    }
+  }, []);
   
   const playNotificationSound = useCallback(() => {
     try {
@@ -165,6 +193,26 @@ export const useDeliveryNotifications = () => {
     };
     fetchDeliveryPartnerId();
   }, []);
+
+  useEffect(() => {
+    const handleVisibilityRefresh = () => {
+      if (document.visibilityState === 'visible') {
+        refreshDeliveryPartner();
+      }
+    };
+
+    const handleWindowFocus = () => {
+      refreshDeliveryPartner();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityRefresh);
+    window.addEventListener('focus', handleWindowFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityRefresh);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [refreshDeliveryPartner]);
 
   // Socket connection effect
   useEffect(() => {

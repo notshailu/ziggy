@@ -64,6 +64,7 @@ import originalSound from "../../../assets/audio/original.mp3"
 import bikeLogo from "../../../assets/bikelogo.png"
 
 // Ola Maps API Key removed
+const COMPLETED_BATCH_ORDERS_STORAGE_KEY = "deliveryCompletedBatchOrderKeys"
 
 // Mock restaurants data
 const mockRestaurants = [
@@ -297,6 +298,104 @@ function animateMarkerSmoothly(marker, newPosition, duration = 1500, animationRe
   }
   
   if (animationRef) animationRef.current = requestAnimationFrame(animate)
+}
+
+const getOrderKey = (order) => {
+  const rawKey =
+    order?.orderId ||
+    order?.id ||
+    order?._id ||
+    order?.orderCode ||
+    order?.code
+
+  return rawKey != null ? String(rawKey) : ""
+}
+
+const getReadableAddress = (...candidates) => {
+  const value = candidates
+    .flat()
+    .find(
+      (candidate) =>
+        typeof candidate === "string" &&
+        candidate.trim() &&
+        !["Restaurant Address", "Restaurant address", "Customer Address"].includes(candidate.trim()),
+    )
+
+  return value?.trim() || ""
+}
+
+const normalizeBatchOrder = (order = {}) => {
+  const restaurantCoords = order?.restaurantId?.location?.coordinates || order?.restaurantLocation?.coordinates
+  const customerCoords = order?.address?.location?.coordinates || order?.customerLocation?.coordinates
+
+  const normalized = {
+    ...order,
+    id: order?.id || order?._id || order?.orderMongoId || order?.mongoId || order?.orderDbId,
+    orderId: order?.orderId || order?.orderCode || order?.code || order?.id || order?._id,
+    orderCode: order?.orderCode || order?.orderId || order?.code,
+    name:
+      order?.name ||
+      order?.restaurantName ||
+      order?.restaurantId?.name ||
+      order?.restaurant?.name ||
+      "Restaurant",
+    address: getReadableAddress(
+      order?.address,
+      order?.restaurantAddress,
+      order?.restaurant?.address,
+      order?.restaurantId?.address,
+      order?.restaurantId?.location?.formattedAddress,
+      order?.restaurantId?.location?.address,
+      order?.restaurantLocation?.formattedAddress,
+      order?.restaurantLocation?.address,
+      order?.location?.formattedAddress,
+      order?.location?.address,
+    ),
+    customerName:
+      order?.customerName ||
+      order?.userId?.name ||
+      order?.customer?.name ||
+      order?.dropCustomerName ||
+      "Customer",
+    customerAddress: getReadableAddress(
+      order?.customerAddress,
+      order?.address?.formattedAddress,
+      order?.address?.addressLine1,
+      order?.address?.street,
+      order?.customerLocation?.address,
+      order?.dropAddress,
+    ),
+    lat:
+      order?.lat ??
+      order?.restaurantLat ??
+      order?.restaurantLocation?.latitude ??
+      order?.restaurantLocation?.lat ??
+      restaurantCoords?.[1] ??
+      null,
+    lng:
+      order?.lng ??
+      order?.restaurantLng ??
+      order?.restaurantLocation?.longitude ??
+      order?.restaurantLocation?.lng ??
+      restaurantCoords?.[0] ??
+      null,
+    customerLat:
+      order?.customerLat ??
+      order?.dropLat ??
+      order?.customerLocation?.latitude ??
+      order?.customerLocation?.lat ??
+      customerCoords?.[1] ??
+      null,
+    customerLng:
+      order?.customerLng ??
+      order?.dropLng ??
+      order?.customerLocation?.longitude ??
+      order?.customerLocation?.lng ??
+      customerCoords?.[0] ??
+      null,
+  }
+
+  return normalized
 }
 
 export default function DeliveryHome() {
@@ -683,6 +782,19 @@ export default function DeliveryHome() {
   const [billImageUrl, setBillImageUrl] = useState(null)
   const [isUploadingBill, setIsUploadingBill] = useState(false)
   const [billImageUploaded, setBillImageUploaded] = useState(false)
+  const [batchOrderDetails, setBatchOrderDetails] = useState({})
+  const [batchReceiptUploads, setBatchReceiptUploads] = useState({})
+  const [completedBatchOrderKeys, setCompletedBatchOrderKeys] = useState(() => {
+    try {
+      const savedKeys = JSON.parse(localStorage.getItem(COMPLETED_BATCH_ORDERS_STORAGE_KEY) || "[]")
+      return Array.isArray(savedKeys) ? savedKeys.map((key) => String(key)) : []
+    } catch {
+      return []
+    }
+  })
+  const [activeReceiptOrderKey, setActiveReceiptOrderKey] = useState(null)
+  const lastAutoAdvancedReceiptKeyRef = useRef(null)
+  const [shownPickupBatchKey, setShownPickupBatchKey] = useState(null)
   const fileInputRef = useRef(null)
   const cameraInputRef = useRef(null)
   const [orderDeliveredButtonProgress, setOrderDeliveredButtonProgress] = useState(0)
@@ -710,6 +822,88 @@ export default function DeliveryHome() {
   const acceptButtonSwipeStartY = useRef(0)
   const acceptButtonIsSwiping = useRef(false)
   const autoShowTimerRef = useRef(null)
+
+  const completedBatchOrderKeySet = useMemo(
+    () => new Set(completedBatchOrderKeys.map((key) => String(key))),
+    [completedBatchOrderKeys],
+  )
+
+  const batchOrders = useMemo(() => {
+    const ordersMap = new Map()
+
+    const upsertOrder = (rawOrder) => {
+      const normalized = normalizeBatchOrder(rawOrder)
+      const key = getOrderKey(normalized)
+      if (!key) return
+      if (completedBatchOrderKeySet.has(String(key))) return
+
+      const existing = ordersMap.get(key) || {}
+      ordersMap.set(key, {
+        ...existing,
+        ...normalized,
+        deliveryState: {
+          ...(existing.deliveryState || {}),
+          ...(normalized.deliveryState || {}),
+        },
+      })
+    }
+
+    ;(deliveryBatchState?.assignedOrders || []).forEach(upsertOrder)
+    Object.values(batchOrderDetails || {}).forEach(upsertOrder)
+    if (selectedRestaurant) {
+      upsertOrder(selectedRestaurant)
+    }
+
+    return Array.from(ordersMap.values())
+  }, [deliveryBatchState?.assignedOrders, batchOrderDetails, selectedRestaurant, completedBatchOrderKeySet])
+
+  const activeBatchKey = useMemo(() => {
+    const keys = batchOrders.map(getOrderKey).filter(Boolean).sort()
+    return keys.join("|")
+  }, [batchOrders])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        COMPLETED_BATCH_ORDERS_STORAGE_KEY,
+        JSON.stringify(completedBatchOrderKeys.map((key) => String(key))),
+      )
+    } catch {
+      // Ignore storage failures in private browsing / quota scenarios.
+    }
+  }, [completedBatchOrderKeys])
+
+  useEffect(() => {
+    const assignedOrderKeys = (deliveryBatchState?.assignedOrders || [])
+      .map((order) => getOrderKey(order))
+      .filter(Boolean)
+      .map((key) => String(key))
+
+    if (!assignedOrderKeys.length) {
+      if (!selectedRestaurant) {
+        setCompletedBatchOrderKeys([])
+      }
+      return
+    }
+
+    setCompletedBatchOrderKeys((prev) => {
+      const nextKeys = prev.filter((key) => assignedOrderKeys.includes(String(key)))
+      return nextKeys.length === prev.length ? prev : nextKeys
+    })
+  }, [deliveryBatchState?.assignedOrders, selectedRestaurant])
+
+  const activeReceiptOrder = useMemo(() => {
+    const selectedKey = getOrderKey(selectedRestaurant)
+    const preferredKey = activeReceiptOrderKey || selectedKey
+
+    return (
+      batchOrders.find((order) => getOrderKey(order) === preferredKey) ||
+      batchOrders.find((order) => getOrderKey(order) === selectedKey) ||
+      batchOrders[0] ||
+      selectedRestaurant ||
+      null
+    )
+  }, [batchOrders, selectedRestaurant, activeReceiptOrderKey])
 
   const {
     bookedGigs,
@@ -739,6 +933,120 @@ export default function DeliveryHome() {
   useEffect(() => {
     isOnlineRef.current = isOnline
   }, [isOnline])
+
+  useEffect(() => {
+    const orderIdsToFetch = (deliveryBatchState?.assignedOrders || [])
+      .map((order) => getOrderKey(order))
+      .filter(Boolean)
+      .filter((orderId) => !completedBatchOrderKeySet.has(String(orderId)))
+      .filter((orderId) => !batchOrderDetails[orderId])
+
+    if (!orderIdsToFetch.length) {
+      return
+    }
+
+    let isCancelled = false
+
+    orderIdsToFetch.forEach((orderId) => {
+      deliveryAPI
+        .getOrderDetails(orderId)
+        .then((response) => {
+          if (isCancelled) return
+
+          const order = response.data?.data?.order || response.data?.order || response.data?.data
+          if (!order) return
+
+          const normalized = normalizeBatchOrder(order)
+          const normalizedKey = getOrderKey(normalized)
+          if (!normalizedKey) return
+
+          setBatchOrderDetails((prev) => ({
+            ...prev,
+            [normalizedKey]: normalized,
+          }))
+        })
+        .catch((error) => {
+          console.warn("Batch order details fetch failed:", orderId, error?.response?.data?.message || error.message)
+        })
+    })
+
+    return () => {
+      isCancelled = true
+    }
+  }, [deliveryBatchState?.assignedOrders, batchOrderDetails, completedBatchOrderKeySet])
+
+  useEffect(() => {
+    if (!activeBatchKey) {
+      setShownPickupBatchKey(null)
+    }
+  }, [activeBatchKey])
+
+  useEffect(() => {
+    if (!showOrderIdConfirmationPopup) {
+      lastAutoAdvancedReceiptKeyRef.current = null
+      return
+    }
+
+    const selectedKey = getOrderKey(selectedRestaurant)
+    const fallbackKey = getOrderKey(batchOrders[0])
+    const nextKey = activeReceiptOrderKey || selectedKey || fallbackKey || null
+
+    setActiveReceiptOrderKey(nextKey)
+
+    const uploadedReceipt = nextKey ? batchReceiptUploads[nextKey] : null
+    setBillImageUrl(uploadedReceipt?.billImageUrl || null)
+    setBillImageUploaded(Boolean(uploadedReceipt?.billImageUrl))
+  }, [
+    showOrderIdConfirmationPopup,
+    selectedRestaurant,
+    batchOrders,
+    activeReceiptOrderKey,
+    batchReceiptUploads,
+  ])
+
+  useEffect(() => {
+    if (!showOrderIdConfirmationPopup || !activeReceiptOrderKey) {
+      return
+    }
+
+    const activeReceipt = batchReceiptUploads[activeReceiptOrderKey]
+    if (!activeReceipt?.billImageUrl) {
+      return
+    }
+
+    const receiptMarker = `${activeReceiptOrderKey}:${activeReceipt.billImageUrl}`
+    if (lastAutoAdvancedReceiptKeyRef.current === receiptMarker) {
+      return
+    }
+
+    lastAutoAdvancedReceiptKeyRef.current = receiptMarker
+
+    const nextPendingOrder = batchOrders.find((order) => {
+      const orderKey = getOrderKey(order)
+      return (
+        orderKey &&
+        orderKey !== activeReceiptOrderKey &&
+        !batchReceiptUploads[orderKey]?.billImageUrl
+      )
+    })
+
+    if (!nextPendingOrder) {
+      setBillImageUrl(activeReceipt.billImageUrl)
+      setBillImageUploaded(true)
+      return
+    }
+
+    const nextPendingKey = getOrderKey(nextPendingOrder)
+    setActiveReceiptOrderKey(nextPendingKey)
+    setBillImageUrl(batchReceiptUploads[nextPendingKey]?.billImageUrl || null)
+    setBillImageUploaded(Boolean(batchReceiptUploads[nextPendingKey]?.billImageUrl))
+    toast.success(`Bill uploaded. Switched to ${nextPendingOrder.orderId || nextPendingOrder.id || "the next order"}.`)
+  }, [
+    showOrderIdConfirmationPopup,
+    activeReceiptOrderKey,
+    batchOrders,
+    batchReceiptUploads,
+  ])
 
   // Sync online status with localStorage changes (from FeedNavbar or other tabs)
   useEffect(() => {
@@ -3631,6 +3939,18 @@ export default function DeliveryHome() {
         if (imageUrl) {
           console.log('✅ Bill image uploaded to Cloudinary:', imageUrl)
           setBillImageUrl(imageUrl)
+          const receiptOrderKey = getOrderKey(activeReceiptOrder || selectedRestaurant)
+          if (receiptOrderKey) {
+            setBatchReceiptUploads((prev) => ({
+              ...prev,
+              [receiptOrderKey]: {
+                billImageUrl: imageUrl,
+                publicId,
+                uploadedAt: new Date().toISOString(),
+                orderId: activeReceiptOrder?.orderId || selectedRestaurant?.orderId || receiptOrderKey,
+              },
+            }))
+          }
           
           // Bill image is uploaded to Cloudinary, now enable the button
           // The bill image URL will be sent when confirming order ID
@@ -3691,20 +4011,20 @@ export default function DeliveryHome() {
 
       // Close popup after animation, then confirm order ID and show polyline to customer
       setTimeout(async () => {
-        setShowOrderIdConfirmationPopup(false)
-        
+        const orderInReceiptFlow = activeReceiptOrder || selectedRestaurant
+
         // Get order ID from selectedRestaurant
-        const orderId = selectedRestaurant?.id || selectedRestaurant?.orderId
-        const confirmedOrderId = selectedRestaurant?.orderId
+        const orderId = orderInReceiptFlow?.id || orderInReceiptFlow?.orderId
+        const confirmedOrderId = orderInReceiptFlow?.orderId
         const isDemoOrder =
           String(orderId || '').startsWith('DEMO-') ||
           String(orderId || '').startsWith('demo-') ||
-          selectedRestaurant?.isDemoOrder
+          orderInReceiptFlow?.isDemoOrder
         
         // CRITICAL: Check if order is already delivered/completed - don't call API
-        const orderStatus = selectedRestaurant?.orderStatus || selectedRestaurant?.status || ''
-        const deliveryPhase = selectedRestaurant?.deliveryPhase || selectedRestaurant?.deliveryState?.currentPhase || ''
-        const deliveryStateStatus = selectedRestaurant?.deliveryState?.status || ''
+        const orderStatus = orderInReceiptFlow?.orderStatus || orderInReceiptFlow?.status || ''
+        const deliveryPhase = orderInReceiptFlow?.deliveryPhase || orderInReceiptFlow?.deliveryState?.currentPhase || ''
+        const deliveryStateStatus = orderInReceiptFlow?.deliveryState?.status || ''
         
         const isDelivered = orderStatus === 'delivered' || 
                             deliveryPhase === 'completed' || 
@@ -3723,14 +4043,14 @@ export default function DeliveryHome() {
                                           deliveryPhase === 'en_route_to_delivery' ||
                                           deliveryPhase === 'picked_up' ||
                                           deliveryStateStatus === 'order_confirmed' ||
-                                          selectedRestaurant?.deliveryState?.orderIdConfirmedAt
+                                          orderInReceiptFlow?.deliveryState?.orderIdConfirmedAt
         
         if (isOrderIdAlreadyConfirmed) {
           console.warn('⚠️ Order ID is already confirmed, skipping confirmation:', {
             orderStatus,
             deliveryPhase,
             deliveryStateStatus,
-            orderIdConfirmedAt: selectedRestaurant?.deliveryState?.orderIdConfirmedAt
+            orderIdConfirmedAt: orderInReceiptFlow?.deliveryState?.orderIdConfirmedAt
           })
           // Don't show error, just update the UI state and close popup
           setSelectedRestaurant(prev => ({
@@ -3781,14 +4101,15 @@ export default function DeliveryHome() {
         try {
           if (isDemoOrder) {
             const customerLat =
-              selectedRestaurant?.customerLat ??
+              orderInReceiptFlow?.customerLat ??
               22.7196
             const customerLng =
-              selectedRestaurant?.customerLng ??
+              orderInReceiptFlow?.customerLng ??
               75.8577
 
             setSelectedRestaurant(prev => ({
               ...prev,
+              ...orderInReceiptFlow,
               orderStatus: 'out_for_delivery',
               status: 'out_for_delivery',
               deliveryPhase: 'en_route_to_delivery',
@@ -3817,8 +4138,10 @@ export default function DeliveryHome() {
           }
 
           // Prefer string orderId (ORD-xxx) for URL; backend accepts both _id and orderId
-          const orderIdForApi = selectedRestaurant?.orderId || selectedRestaurant?.id
-          const confirmedOrderIdForApi = selectedRestaurant?.orderId || (orderIdForApi && String(orderIdForApi).startsWith('ORD-') ? orderIdForApi : undefined)
+          const orderIdForApi = orderInReceiptFlow?.orderId || orderInReceiptFlow?.id
+          const confirmedOrderIdForApi = orderInReceiptFlow?.orderId || (orderIdForApi && String(orderIdForApi).startsWith('ORD-') ? orderIdForApi : undefined)
+          const selectedReceipt = batchReceiptUploads[getOrderKey(orderInReceiptFlow)]
+          const activeBillImageUrl = selectedReceipt?.billImageUrl || billImageUrl
 
           // Call backend API to confirm order ID with bill image
           console.log('📦 Confirming order ID:', { 
@@ -3826,7 +4149,7 @@ export default function DeliveryHome() {
             confirmedOrderIdForApi, 
             lat: currentLocation[0], 
             lng: currentLocation[1],
-            billImageUrl 
+            billImageUrl: activeBillImageUrl 
           })
           
           // Update API call to include bill image URL
@@ -3834,7 +4157,7 @@ export default function DeliveryHome() {
             lat: currentLocation[0],
             lng: currentLocation[1]
           }, {
-            billImageUrl: billImageUrl
+            billImageUrl: activeBillImageUrl
           })
           
           console.log('✅ Order ID confirmed, response:', response.data)
@@ -3845,18 +4168,18 @@ export default function DeliveryHome() {
             const routeData = orderData.route || order.deliveryState?.routeToDelivery
             
             // Update selectedRestaurant with customer address
-            if (order && selectedRestaurant) {
+            if (order && orderInReceiptFlow) {
               const customerCoords = order.address?.location?.coordinates
               const customerLat = customerCoords?.[1]
               const customerLng = customerCoords?.[0]
               
               if (customerLat && customerLng) {
                 const updatedRestaurant = {
-                  ...selectedRestaurant,
-                  customerName: order.userId?.name || selectedRestaurant.customerName,
+                  ...orderInReceiptFlow,
+                  customerName: order.userId?.name || orderInReceiptFlow.customerName,
                   customerAddress: order.address?.formattedAddress ||
                                   (order.address?.street ? `${order.address.street}, ${order.address.city || ''}, ${order.address.state || ''}`.trim() : '') ||
-                                  selectedRestaurant.customerAddress,
+                                  orderInReceiptFlow.customerAddress,
                   customerLat,
                   customerLng
                 }
@@ -4008,12 +4331,11 @@ export default function DeliveryHome() {
             toast.success('Order is out for delivery. Route to customer is on the map.', { duration: 4000 })
             
             // Show Reached Drop popup instantly after Order Picked Up is confirmed
-            // Use setTimeout to ensure state updates are processed and useEffect doesn't block it
             console.log('✅ Showing Reached Drop popup instantly after Order Picked Up confirmation')
             setTimeout(() => {
               setShowReachedDropPopup(true)
               console.log('✅ Reached Drop popup state set to true')
-            }, 100) // Small delay to ensure showOrderIdConfirmationPopup state is updated
+            }, 100)
             
           } else {
             console.error('❌ Failed to confirm order ID:', response.data)
@@ -4164,6 +4486,11 @@ export default function DeliveryHome() {
         // Call completeDelivery API so order status becomes "delivered" everywhere
         ;(async () => {
           try {
+            const completedOrderKey = getOrderKey(selectedRestaurant || newOrder)
+            const nextBatchOrder =
+              activeBatchRoute?.remainingStops?.find((stop) => stop?.order)?.order ||
+              batchOrders.find((order) => getOrderKey(order) !== completedOrderKey) ||
+              null
             const orderIdForApi =
               selectedRestaurant?.id ||
               newOrder?.orderMongoId ||
@@ -4211,7 +4538,10 @@ export default function DeliveryHome() {
                   status: 'delivered'
                 }
               } : prev)
-              setShowPaymentPage(true)
+              const advancedToNextOrder = await advanceToNextBatchOrder(completedOrderKey, nextBatchOrder)
+              if (!advancedToNextOrder) {
+                setShowPaymentPage(true)
+              }
               toast.success('Demo delivery completed')
               return
             }
@@ -4270,8 +4600,11 @@ export default function DeliveryHome() {
                 toast.success("Order marked as delivered")
               }
 
-              // Clear active order from UI so everywhere reflects delivered state
-              clearOrderData()
+              const advancedToNextOrder = await advanceToNextBatchOrder(completedOrderKey, nextBatchOrder)
+              if (!advancedToNextOrder) {
+                // Clear active order from UI so everywhere reflects delivered state
+                clearOrderData()
+              }
             } else {
               console.error("❌ Failed to complete delivery:", response.data)
               toast.error(
@@ -6873,6 +7206,7 @@ export default function DeliveryHome() {
   const clearOrderData = useCallback(() => {
     console.log('🧹 Clearing order data...');
     localStorage.removeItem('deliveryActiveOrder');
+    localStorage.removeItem(COMPLETED_BATCH_ORDERS_STORAGE_KEY);
     setSelectedRestaurant(null);
     setShowReachedDropPopup(false);
     setShowOrderDeliveredAnimation(false);
@@ -6881,6 +7215,8 @@ export default function DeliveryHome() {
     setShowNewOrderPopup(false);
     setShowreachedPickupPopup(false);
     setShowOrderIdConfirmationPopup(false);
+    setShownPickupBatchKey(null);
+    setCompletedBatchOrderKeys([]);
     clearNewOrder();
     clearOrderReady();
     // Clear accepted orders list when going offline
@@ -7392,10 +7728,17 @@ export default function DeliveryHome() {
       return
     }
 
+    if (shownPickupBatchKey && shownPickupBatchKey === activeBatchKey) {
+      return
+    }
+
     // Show "Reached Pickup" popup immediately when order is in pickup phase (no distance check)
     if (!showreachedPickupPopup) {
       console.log('✅ Order is in pickup phase, showing Reached Pickup popup immediately')
       setShowreachedPickupPopup(true)
+      if (activeBatchKey) {
+        setShownPickupBatchKey(activeBatchKey)
+      }
       
       // Close directions map if open
       setShowDirectionsMap(false)
@@ -7414,6 +7757,8 @@ export default function DeliveryHome() {
     Boolean(showOrderDeliveredAnimation),
     Boolean(showCustomerReviewPopup),
     Boolean(showPaymentPage),
+    activeBatchKey,
+    shownPickupBatchKey,
     selectedRestaurant?.orderStatus,
     selectedRestaurant?.status,
     selectedRestaurant?.deliveryPhase,
@@ -7629,8 +7974,26 @@ export default function DeliveryHome() {
     return selectedRestaurant?.deliveryState?.status ?? null
   }, [selectedRestaurant?.deliveryState?.status])
 
+  const batchOrderLookup = useMemo(() => {
+    const map = new Map()
+    batchOrders.forEach((order) => {
+      const key = getOrderKey(order)
+      if (key) {
+        map.set(key, order)
+      }
+    })
+    return map
+  }, [batchOrders])
+
   const activeBatchRoute = useMemo(() => {
-    const routeStops = deliveryBatchState?.route || []
+    const routeStops = (deliveryBatchState?.route || []).filter((stop) => {
+      const stopKey =
+        stop?.orderId?.toString?.() ||
+        stop?.orderId ||
+        stop?.orderCode
+
+      return !completedBatchOrderKeySet.has(String(stopKey))
+    })
     if (!routeStops.length) {
       return null
     }
@@ -7668,19 +8031,28 @@ export default function DeliveryHome() {
       return String(stopKey) !== String(currentStopKey)
     })
 
+    const currentStopOrder =
+      batchOrderLookup.get(String(currentStop?.orderId || currentStop?.orderCode || "")) || null
+
+    const enrichedRemainingStops = remainingStops.map((stop) => ({
+      ...stop,
+      order: batchOrderLookup.get(String(stop?.orderId || stop?.orderCode || "")) || null,
+    }))
+
     return {
-      totalActive: deliveryBatchState?.activeAssignedOrderCount || routeStops.length,
+      totalActive: routeStops.length,
       currentStop,
-      remainingStops,
+      currentStopOrder,
+      remainingStops: enrichedRemainingStops,
     }
-  }, [deliveryBatchState, selectedRestaurant?.id, selectedRestaurant?.orderId])
+  }, [deliveryBatchState, selectedRestaurant?.id, selectedRestaurant?.orderId, batchOrderLookup, completedBatchOrderKeySet])
 
   const renderBatchRoutePanel = (extraClassName = "mb-4") => {
     if (!activeBatchRoute?.currentStop) {
       return null
     }
 
-    const { totalActive, currentStop, remainingStops } = activeBatchRoute
+    const { totalActive, currentStop, currentStopOrder, remainingStops } = activeBatchRoute
 
     return (
       <div className={`${extraClassName} rounded-2xl border border-gray-200 bg-gray-50 p-4`}>
@@ -7705,6 +8077,12 @@ export default function DeliveryHome() {
           <p className="mt-1 text-sm font-semibold text-gray-900">
             {currentStop?.orderCode || "Current order"}
           </p>
+          <p className="mt-1 text-sm text-gray-600">
+            {currentStopOrder?.customerName || currentStopOrder?.name || "Address loading..."}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-gray-500">
+            {currentStopOrder?.customerAddress || currentStopOrder?.address || "Address will appear here"}
+          </p>
           <p className="mt-1 text-xs text-gray-600">
             Sequence #{currentStop?.sequence || 1}
           </p>
@@ -7721,6 +8099,9 @@ export default function DeliveryHome() {
                   <p className="text-sm font-semibold text-gray-900">
                     {stop?.orderCode || "Upcoming stop"}
                   </p>
+                  <p className="mt-0.5 text-xs text-gray-500">
+                    {stop?.order?.customerAddress || stop?.order?.address || "Address pending"}
+                  </p>
                   <p className="text-xs text-gray-500">
                     Stop #{stop?.sequence || "-"}
                   </p>
@@ -7734,6 +8115,86 @@ export default function DeliveryHome() {
         )}
       </div>
     )
+  }
+
+  const advanceToNextBatchOrder = async (completedOrderKey, nextOrder) => {
+    if (!completedOrderKey || !nextOrder) {
+      return false
+    }
+
+    setCompletedBatchOrderKeys((prev) =>
+      prev.includes(completedOrderKey) ? prev : [...prev, completedOrderKey],
+    )
+
+    const nextOrderKey = getOrderKey(nextOrder)
+    const nextCustomerLat =
+      nextOrder?.customerLat ??
+      nextOrder?.address?.location?.coordinates?.[1] ??
+      null
+    const nextCustomerLng =
+      nextOrder?.customerLng ??
+      nextOrder?.address?.location?.coordinates?.[0] ??
+      null
+
+    const nextActiveOrder = {
+      ...nextOrder,
+      orderStatus: 'out_for_delivery',
+      status: 'out_for_delivery',
+      deliveryPhase: 'en_route_to_delivery',
+      customerLat: nextCustomerLat,
+      customerLng: nextCustomerLng,
+      deliveryState: {
+        ...(nextOrder?.deliveryState || {}),
+        currentPhase: 'en_route_to_delivery',
+        status: 'order_confirmed',
+      },
+    }
+
+    setSelectedRestaurant(nextActiveOrder)
+    setActiveReceiptOrderKey(nextOrderKey || null)
+    setShowPaymentPage(false)
+    setShowCustomerReviewPopup(false)
+    setShowOrderDeliveredAnimation(false)
+    setShowReachedDropPopup(false)
+    localStorage.setItem('deliveryActiveOrder', JSON.stringify(nextActiveOrder))
+
+    const currentLocation = riderLocation || lastLocationRef.current
+    if (currentLocation?.length === 2 && nextCustomerLat != null && nextCustomerLng != null) {
+      try {
+        const directionsResult = await calculateRouteWithDirectionsAPI(
+          currentLocation,
+          { lat: nextCustomerLat, lng: nextCustomerLng }
+        )
+
+        if (directionsResult) {
+          setRoutePolyline([])
+          fullRoutePolylineRef.current = []
+          setDirectionsResponse(directionsResult)
+          directionsResponseRef.current = directionsResult
+          updateLiveTrackingPolyline(directionsResult, currentLocation)
+          setShowRoutePath(true)
+        } else {
+          const fallbackRoute = [
+            [currentLocation[0], currentLocation[1]],
+            [nextCustomerLat, nextCustomerLng],
+          ]
+          setRoutePolyline(fallbackRoute)
+          updateRoutePolyline(fallbackRoute)
+          setShowRoutePath(true)
+        }
+      } catch (error) {
+        const fallbackRoute = [
+          [currentLocation[0], currentLocation[1]],
+          [nextCustomerLat, nextCustomerLng],
+        ]
+        setRoutePolyline(fallbackRoute)
+        updateRoutePolyline(fallbackRoute)
+        setShowRoutePath(true)
+      }
+    }
+
+    toast.success(`Loaded next order ${nextOrder.orderId || nextOrder.id || ''}`.trim())
+    return true
   }
   
   useEffect(() => {
@@ -10464,14 +10925,105 @@ export default function DeliveryHome() {
             <div className="bg-gray-50 rounded-xl p-6 mb-6 overflow-hidden">
               <p className="text-gray-500 text-xs mb-2">Order ID</p>
               <p className="text-2xl sm:text-3xl font-bold text-gray-900 tracking-wider whitespace-nowrap overflow-x-auto min-w-0">
-                {selectedRestaurant?.orderId || selectedRestaurant?.id || newOrder?.orderId || newOrder?.orderMongoId || 'ORD1234567890'}
+                {activeReceiptOrder?.orderId || activeReceiptOrder?.id || selectedRestaurant?.orderId || newOrder?.orderId || newOrder?.orderMongoId || 'ORD1234567890'}
               </p>
             </div>
+
+            {batchOrders.length > 1 && (
+              <div className="mb-6">
+                <div className="rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50 via-white to-teal-50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-emerald-700">
+                        Batch pickup
+                      </p>
+                      <p className="mt-1 text-sm font-semibold text-gray-900">
+                        {batchOrders.length} orders from this pickup
+                      </p>
+                    </div>
+                    <div className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-emerald-700 shadow-sm">
+                      One bill each
+                    </div>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <div className="rounded-xl bg-white px-3 py-2 text-center shadow-sm">
+                      <p className="text-[11px] uppercase tracking-[0.16em] text-gray-400">Total</p>
+                      <p className="mt-1 text-lg font-bold text-gray-900">{batchOrders.length}</p>
+                    </div>
+                    <div className="rounded-xl bg-white px-3 py-2 text-center shadow-sm">
+                      <p className="text-[11px] uppercase tracking-[0.16em] text-gray-400">Uploaded</p>
+                      <p className="mt-1 text-lg font-bold text-emerald-700">
+                        {batchOrders.filter((order) => Boolean(batchReceiptUploads[getOrderKey(order)]?.billImageUrl)).length}
+                      </p>
+                    </div>
+                    <div className="rounded-xl bg-white px-3 py-2 text-center shadow-sm">
+                      <p className="text-[11px] uppercase tracking-[0.16em] text-gray-400">Pending</p>
+                      <p className="mt-1 text-lg font-bold text-amber-600">
+                        {batchOrders.filter((order) => !batchReceiptUploads[getOrderKey(order)]?.billImageUrl).length}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="mt-4 text-xs font-semibold uppercase tracking-[0.18em] text-gray-500 mb-3">
+                  Assigned Orders
+                </p>
+                <div className="space-y-2">
+                  {batchOrders.map((order, index) => {
+                    const orderKey = getOrderKey(order)
+                    const isActive = orderKey === getOrderKey(activeReceiptOrder)
+                    const hasReceipt = Boolean(batchReceiptUploads[orderKey]?.billImageUrl)
+
+                    return (
+                      <button
+                        key={orderKey || index}
+                        type="button"
+                        onClick={() => {
+                          setActiveReceiptOrderKey(orderKey)
+                          setBillImageUrl(batchReceiptUploads[orderKey]?.billImageUrl || null)
+                          setBillImageUploaded(Boolean(batchReceiptUploads[orderKey]?.billImageUrl))
+                        }}
+                        className={`w-full rounded-2xl border px-4 py-3 text-left transition-all ${
+                          isActive ? 'border-green-500 bg-green-50 shadow-sm' : 'border-gray-200 bg-white'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-3">
+                            <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold ${
+                              isActive ? 'bg-green-600 text-white' : 'bg-gray-100 text-gray-600'
+                            }`}>
+                              {index + 1}
+                            </div>
+                            <div>
+                              <p className="text-sm font-semibold text-gray-900">
+                                {order.orderId || order.orderCode || `Order ${index + 1}`}
+                              </p>
+                              <p className="text-xs font-medium text-gray-600">
+                                {order.customerName || `Customer ${index + 1}`}
+                              </p>
+                              <p className="mt-1 text-xs leading-relaxed text-gray-500">
+                                {order.customerAddress || order.address || 'Address pending'}
+                              </p>
+                            </div>
+                          </div>
+                          <span className={`shrink-0 rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                            hasReceipt ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'
+                          }`}>
+                            {hasReceipt ? 'Bill Uploaded' : 'Pending'}
+                          </span>
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Bill Image Upload Section */}
             <div className="mb-6">
               <p className="text-gray-600 text-sm mb-3 text-center">
-                {billImageUploaded ? '✅ Bill image uploaded' : 'Please capture bill image'}
+                {billImageUploaded ? '✅ Bill image uploaded for this order' : 'Please capture bill image for this order'}
               </p>
               
               {/* Camera Button */}
@@ -10704,6 +11256,50 @@ export default function DeliveryHome() {
               Order ID: {selectedRestaurant?.orderId || 'ORD1234567890'}
             </p>
           </div>
+
+          {activeBatchRoute?.remainingStops?.length > 0 && (
+            <div className="mb-6 rounded-2xl border border-gray-200 bg-gray-50 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-gray-500">
+                    Remaining orders
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-gray-900">
+                    {activeBatchRoute.remainingStops.length} more {activeBatchRoute.remainingStops.length === 1 ? 'delivery' : 'deliveries'} in this batch
+                  </p>
+                </div>
+                <div className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-gray-700 shadow-sm">
+                  After this drop
+                </div>
+              </div>
+
+              <div className="mt-3 space-y-2">
+                {activeBatchRoute.remainingStops.map((stop, index) => (
+                  <div
+                    key={`${stop?.orderId || stop?.orderCode}-${stop?.sequence || index}`}
+                    className="rounded-xl bg-white px-3 py-3"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-gray-900">
+                          {stop?.orderCode || stop?.order?.orderId || `Order ${index + 1}`}
+                        </p>
+                        <p className="mt-1 text-xs text-gray-500">
+                          {stop?.order?.customerName || 'Customer'}
+                        </p>
+                        <p className="mt-1 text-xs leading-relaxed text-gray-500">
+                          {stop?.order?.customerAddress || stop?.order?.address || 'Address pending'}
+                        </p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-teal-50 px-2.5 py-1 text-[11px] font-semibold text-teal-700">
+                        Stop #{stop?.sequence || index + 2}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Action Buttons - Call (customer), Chat, Map (navigation to customer) */}
           <div className="flex gap-3 mb-6">
